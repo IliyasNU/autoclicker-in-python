@@ -13,7 +13,9 @@ from unittest.mock import Mock, patch
 
 from ac_engine import ClickEngine, PynputMouse
 from ac_hotkeys import GlobalShortcuts
-from ac_settings import Settings, ValidationError, load_settings, save_settings
+from ac_settings import (
+    Settings, ValidationError, combine_interval, load_settings, save_settings, split_interval,
+)
 
 
 class ControlledEvent:
@@ -95,8 +97,46 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(load_settings(path), (value, ""))
             doc = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(set(doc), {"version", "settings"})
+            self.assertEqual(doc["version"], 2)
             self.assertEqual(set(doc["settings"]), set(asdict(Settings())))
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_interval_parts_preserve_units_and_fractional_milliseconds(self):
+        parts = dict(hours="1", minutes="2", seconds="3", milliseconds="4.5")
+        self.assertEqual(combine_interval(parts), "3723004.5")
+        for unit, value in (("ms", "3723004.5"), ("s", "3723.0045")):
+            self.assertEqual(split_interval(replace(Settings(), interval=value, unit=unit)), parts)
+        self.assertEqual(combine_interval(split_interval(Settings())), "100")
+
+    def test_interval_parts_reject_empty_bad_ranges_nan_and_zero(self):
+        base = dict(hours="0", minutes="0", seconds="0", milliseconds="100")
+        for name, bad_values in {
+            "hours": ("", "-1", "1.5", "nan", "999999999999"),
+            "minutes": ("", "60", "-1", "inf"),
+            "seconds": ("", "60", "0.1", "NaN"),
+            "milliseconds": ("", "-1", "1000", "nan", "inf", "-inf", "text", "1,5", "0", "0.1"),
+        }.items():
+            for value in bad_values:
+                with self.subTest(name=name, value=value), self.assertRaises(ValidationError):
+                    combine_interval({**base, name: value})
+
+    def test_legacy_settings_migrate_without_losing_run_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            legacy = asdict(replace(Settings(), interval="1.25", unit="s", x="-50", mode="double"))
+            del legacy["toggle_key"], legacy["stop_key"]
+            path.write_text(json.dumps({"version": 1, "settings": legacy}), encoding="utf-8")
+            value, warning = load_settings(path)
+            self.assertFalse(warning)
+            self.assertEqual(value.seconds, 1.25)
+            self.assertEqual((value.mode, value.x, value.toggle_key, value.stop_key), ("double", "-50", "F6", "F7"))
+            save_settings(path, value)
+            self.assertEqual(json.loads(path.read_text())["version"], 2)
+
+    def test_invalid_hotkeys(self):
+        for options in (dict(toggle_key="F13"), dict(stop_key="Escape"), dict(stop_key="F6")):
+            with self.subTest(options=options), self.assertRaises(ValidationError):
+                replace(Settings(), **options).validated()
 
     def test_missing_corrupt_wrong_schema_and_nonfinite(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -344,12 +384,31 @@ class ShortcutTests(unittest.TestCase):
         callbacks = factory.call_args.args[0]
         callbacks["<f6>"]()
         callbacks["<f7>"]()
-        self.assertEqual(output.call_args_list, [(('start',), {}), (('stop',), {})])
+        self.assertEqual(output.call_args_list, [(('toggle',), {}), (('stop',), {})])
         self.assertFalse(keys.close())
         listener.is_alive.return_value = False
         self.assertTrue(keys.close())
         listener.stop.assert_called_once()
         listener.join.assert_called_with(0)
+
+    def test_rebinding_changes_callbacks_without_restarting_listener(self):
+        output = Mock()
+        factory = Mock()
+        keys = GlobalShortcuts(output, factory)
+        keys.start()
+        callbacks = factory.call_args.args[0]
+        keys.configure("F8", "F9")
+        callbacks["<f6>"]()
+        callbacks["<f7>"]()
+        output.assert_not_called()
+        callbacks["<f8>"]()
+        callbacks["<f9>"]()
+        self.assertEqual(output.call_args_list, [(('toggle',), {}), (('stop',), {})])
+        factory.assert_called_once()
+        with self.assertRaises(ValidationError):
+            keys.configure("F10", "F10")
+        callbacks["<f8>"]()
+        self.assertEqual(output.call_count, 3)
 
     def test_initialization_and_async_failures_visible(self):
         for startup in (True, False):
@@ -389,6 +448,9 @@ class FakeShortcuts:
         self.enqueue = enqueue
         self.closed = False
 
+    def configure(self, toggle_key, stop_key):
+        self.keys = (toggle_key, stop_key)
+
     def start(self):
         pass
 
@@ -417,6 +479,7 @@ class GuiTests(unittest.TestCase):
         self.addCleanup(self.cleanup_app)
 
     def cleanup_app(self):
+        self.app.close()
         self.app.engine.close(2)
         self.app.shortcuts.close()
         try:
@@ -426,33 +489,33 @@ class GuiTests(unittest.TestCase):
 
     def test_invalid_input_recovery_and_counts(self):
         app = self.app
-        app.vars["interval"].set("nan")
+        app.interval_vars["milliseconds"].set("nan")
         app.start()
         self.assertTrue(app.errors["interval"].get())
         self.assertFalse(app.engine.snapshot().active)
-        app.vars["interval"].set("10")
+        app.interval_vars["milliseconds"].set("10")
         app.vars["repeat"].set("count")
         app.vars["count"].set("1")
         app.vars["mode"].set("double")
         app.start()
         self.assertTrue(app.engine.wait())
         app._render()
-        self.assertEqual(app.counter.get(), "Клики: 2   ·   Повторения: 1")
-        self.assertEqual(app.status.get(), "Остановлен")
-        self.assertEqual(str(app.controls["interval"][0].cget("state")), "normal")
+        self.assertEqual(app.counter.get(), "Clicks: 2   |   Repeats: 1")
+        self.assertEqual(app.status.get(), "Stopped")
+        self.assertEqual(str(app.controls["milliseconds"][0].cget("state")), "normal")
 
     def test_lock_stop_and_shortcut_error(self):
         app = self.app
         app.vars["delay"].set("86400")
         app.start()
-        self.assertEqual(str(app.controls["interval"][0].cget("state")), "disabled")
-        self.assertIn("Ожидание", app.status.get())
+        self.assertEqual(str(app.controls["milliseconds"][0].cget("state")), "disabled")
+        self.assertIn("Waiting", app.status.get())
         app.enqueue("hotkey_error", "test hook error")
         app._tick()
         self.assertTrue(app.engine.wait())
         app._render()
         self.assertIn("test hook error", app.notice.get())
-        self.assertEqual(str(app.controls["interval"][0].cget("state")), "normal")
+        self.assertEqual(str(app.controls["milliseconds"][0].cget("state")), "normal")
         self.assertEqual(self.mouse.calls, [])
 
     def test_stop_wins_over_key_repeat_and_close_during_delay(self):
@@ -479,6 +542,90 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(app.engine.wait())
         self.assertIn("disk read only", app.notice.get())
         self.assertEqual(len(self.mouse.calls), 1)
+
+    def test_toggle_starts_and_cancels_wait_and_stop_has_priority(self):
+        app = self.app
+        app.vars["delay"].set("3600")
+        app.enqueue("toggle")
+        app._tick()
+        self.assertTrue(app.engine.snapshot().active)
+        app.enqueue("toggle")
+        app._tick()
+        self.assertTrue(app.engine.wait())
+        app.enqueue("toggle")
+        app.enqueue("stop")
+        app._tick()
+        self.assertFalse(app.engine.snapshot().active)
+        self.assertEqual(self.mouse.calls, [])
+
+    def test_pick_location_captures_without_clicking_and_blocks_start(self):
+        app = self.app
+        self.mouse.position = (-200, 300)
+        app.pick_location()
+        self.assertIsNotNone(app.picker)
+        self.assertIn("3 seconds", app.pick_message.get())
+        app.start()
+        self.assertFalse(app.engine.snapshot().active)
+        app._capture_position()
+        self.assertIsNone(app.picker)
+        self.assertIsNone(app._pick_after)
+        self.assertEqual((app.vars["position"].get(), app.vars["x"].get(), app.vars["y"].get()), ("fixed", "-200", "300"))
+        self.assertEqual(self.mouse.calls, [])
+
+    def test_cancel_pick_and_close_remove_pending_capture(self):
+        app = self.app
+        app.vars["x"].set("40")
+        app.pick_location()
+        app.stop()
+        self.assertIsNone(app.picker)
+        self.assertIsNone(app._pick_after)
+        self.assertEqual(app.vars["x"].get(), "40")
+        app.pick_location()
+        app.close()
+        self.assertIsNone(app.picker)
+        self.assertIsNone(app._pick_after)
+        self.assertEqual(self.mouse.calls, [])
+
+    def test_pick_backend_error_preserves_coordinates_and_is_visible(self):
+        app = self.app
+        app.vars["x"].set("45")
+        app._mouse_factory = Mock(side_effect=OSError("no cursor"))
+        app.pick_location()
+        app._capture_position()
+        self.assertIsNone(app.picker)
+        self.assertEqual(app.vars["x"].get(), "45")
+        self.assertIn("no cursor", app.notice.get())
+
+    def test_hotkey_dialog_validates_updates_buttons_and_persists(self):
+        app = self.app
+        app.show_hotkeys()
+        app.hotkey_vars["stop_key"].set("F6")
+        app._apply_hotkeys()
+        self.assertIsNotNone(app.hotkey_dialog)
+        self.assertIn("different keys", app.hotkey_message.get())
+        app.hotkey_vars["toggle_key"].set("F8")
+        app.hotkey_vars["stop_key"].set("F9")
+        app._apply_hotkeys()
+        self.assertIsNone(app.hotkey_dialog)
+        self.assertEqual(app.shortcuts.keys, ("F8", "F9"))
+        self.assertEqual(app.start_button.cget("text"), "Start (F8)")
+        self.assertEqual(app.stop_button.cget("text"), "Stop (F8)")
+        settings, warning = load_settings(app.path)
+        self.assertFalse(warning)
+        self.assertEqual((settings.toggle_key, settings.stop_key), ("F8", "F9"))
+
+    def test_cancel_hotkeys_and_help_do_not_change_settings(self):
+        app = self.app
+        app.show_hotkeys()
+        app.hotkey_vars["toggle_key"].set("F10")
+        app._close_hotkeys()
+        self.assertEqual(app.vars["toggle_key"].get(), "F6")
+        app.show_help()
+        original = app.help_dialog
+        app.show_help()
+        self.assertIs(app.help_dialog, original)
+        app._close_help()
+        self.assertIsNone(app.help_dialog)
 
 
 if __name__ == "__main__":

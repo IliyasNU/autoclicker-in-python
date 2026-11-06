@@ -1,4 +1,7 @@
 """Lazy global shortcuts; callbacks only enqueue commands, never touch tkinter."""
+import threading
+
+from ac_settings import FUNCTION_KEYS, validate_hotkeys
 
 
 class GlobalShortcuts:
@@ -8,6 +11,21 @@ class GlobalShortcuts:
         self._listener = None
         self._closing = False
         self._failed = False
+        self._lock = threading.Lock()
+        self._toggle_key = "F6"
+        self._stop_key = "F7"
+
+    def configure(self, toggle_key, stop_key):
+        """Atomically rebind without stopping/restarting the global listener."""
+        validate_hotkeys(toggle_key, stop_key)
+        with self._lock:
+            self._toggle_key, self._stop_key = toggle_key, stop_key
+
+    def _dispatch(self, key):
+        with self._lock:
+            command = "toggle" if key == self._toggle_key else "stop" if key == self._stop_key else None
+        if command is not None:
+            self._enqueue(command)
 
     def start(self):
         if self._listener is not None:
@@ -16,8 +34,7 @@ class GlobalShortcuts:
             if self._factory is None:
                 self._factory = self._make_listener
             self._listener = self._factory({
-                "<f6>": lambda: self._enqueue("start"),
-                "<f7>": lambda: self._enqueue("stop"),
+                f"<{key.lower()}>": lambda name=key: self._dispatch(name) for key in FUNCTION_KEYS
             })
             self._listener.start()
         except Exception as exc:
@@ -26,7 +43,7 @@ class GlobalShortcuts:
 
     def _make_listener(self, callbacks):
         from pynput.keyboard import Key, Listener
-        actions = {Key.f6: callbacks["<f6>"], Key.f7: callbacks["<f7>"]}
+        actions = {getattr(Key, key[1:-1]): action for key, action in callbacks.items()}
         pressed = set()
         enqueue = self._enqueue
 
